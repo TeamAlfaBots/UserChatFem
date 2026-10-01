@@ -161,14 +161,14 @@ def clean_reply(text: str) -> str:
     return text[:400].strip()
 
 
-async def ask_deepseek(messages: list[dict]) -> str | None:
+async def _ask_once(messages: list[dict], max_tokens: int) -> str | None:
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": messages,
         "temperature": 1.3,
         "top_p": 0.95,
         "frequency_penalty": 0.3,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": max_tokens,
     }
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -186,11 +186,26 @@ async def ask_deepseek(messages: list[dict]) -> str | None:
                     log.error("DeepSeek HTTP %s: %s", r.status, (await r.text())[:300])
                     return None
                 data = await r.json()
-        text = clean_reply(data["choices"][0]["message"]["content"])
-        return text or None
+        choice = data["choices"][0]
+        content = (choice.get("message") or {}).get("content")
+        if not content or not content.strip():
+            log.warning(
+                "Empty reply from model (finish_reason=%s)", choice.get("finish_reason")
+            )
+            return None
+        return clean_reply(content) or None
     except Exception:
         log.exception("DeepSeek request failed")
         return None
+
+
+async def ask_deepseek(messages: list[dict]) -> str | None:
+    """Try once; if the model returns an empty reply (e.g. reasoning models that
+    spend all tokens on thinking), retry once with 3x max_tokens."""
+    reply = await _ask_once(messages, MAX_TOKENS)
+    if reply:
+        return reply
+    return await _ask_once(messages, MAX_TOKENS * 3)
 
 
 # ------------------------------------------------------------------ helpers
@@ -364,3 +379,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
