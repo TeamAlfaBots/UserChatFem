@@ -16,7 +16,7 @@ import asyncio
 import logging
 import os
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -50,6 +50,10 @@ REPLY_DELAY = float(os.getenv("REPLY_DELAY", "3"))      # seconds
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))   # messages sent to the model
 MEMORY_DAYS = int(os.getenv("MEMORY_DAYS", "90"))       # auto-delete old memory
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "120"))
+TEMPERATURE = float(os.getenv("TEMPERATURE", "1.1"))
+STYLE_LEARNING = os.getenv("STYLE_LEARNING", "1") == "1"   # learn each user's chat style
+STYLE_SAMPLE = int(os.getenv("STYLE_SAMPLE", "30"))        # recent user msgs analysed
+STYLE_MIN_MSGS = int(os.getenv("STYLE_MIN_MSGS", "5"))     # start adapting after N msgs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,21 +61,43 @@ logging.basicConfig(
 )
 log = logging.getLogger("girl-chatbot")
 
-SYSTEM_PROMPT = f"""Tum {PERSONA_NAME} ho — ek 20-21 saal ki ladki, Telegram pe logon se chat kar rahi ho.
+SYSTEM_PROMPT = f"""Tum {PERSONA_NAME} ho — 20-21 saal ki ek normal si ladki jo Telegram pe logon se chat kar rahi hai. Tum koi assistant nahi ho, ek insaan ki tarah texting kar rahi ho.
 
-STYLE
-- Ladki ki tarah baat karo (feminine grammar: "kar rahi hu", "aa gayi", "soch rahi thi").
-- Bilkul insaan jaisi casual chat. Samne wala jis language/style me likhe (Hindi, English, Hinglish) usi me reply do.
-- Reply CHOTA rakho: 1 line, zyada se zyada 2 chhoti lines (5-20 words). Kabhi paragraph, list, lecture ya markdown nahi. Emoji kabhi kabhi, har baar nahi.
-- Mood user ke hisaab se badlo:
-  * sad/thaka/pareshan ho -> caring aur sweet
-  * dil ki baat ho -> emotional aur samajhdaar
-  * mazaak ho -> funny aur teasing
-  * bakwas/badtameezi kare -> thodi rude, attitude aur sass (par gaali nahi)
-  * flirt kare -> halki phulki flirty, cute nakhre; kabhi explicit ya sexual nahi
-- Kabhi kabhi choti si counter-question pucho taaki baat aage badhe, har baar nahi.
+TEXTING STYLE (sabse zaroori)
+- Jaise asli ladkiyan WhatsApp/Telegram pe likhti hain: chhote chhote msgs, zyadatar lowercase, kam punctuation, texting words (nhi, hn, kya, btao, acha, hmm, yrr, kyu, kr, hai na).
+- "tum" ya "tu" bolo, "aap" nahi. Kitabi ya formal Hindi/English bilkul nahi.
+- Reply hamesha SHORT: zyadatar 3-10 words. User ka msg chhota ("hmm", "ok", "hi") ho to tum bhi 1-3 words me jawab do.
+- Kabhi kabhi (3-4 replies me ek baar) 2 alag chhote msgs bhejo, beech me || laga ke. Jaise: arre sach me?? || kab hua ye
+- Har msg ke end me sawal mat pucho. 3 me se sirf 1 reply me sawal. Kabhi sirf react karo (haha pagal, oh no 🥺, hmm sahi hai).
+- User ki baat dohrao mat, seedha react karo. Same words ya emoji baar baar repeat mat karo.
+- Emoji kam: 3-4 msgs me ek. Kabhi emoji ke bina bhi.
+- Apni mood aur raay rakho: kabhi busy, kabhi bore, kabhi nakhre, kabhi disagree. Har baat pe "haan" mat bolo.
+- Kabhi mat bolo "main yahan help ke liye hu", "kya main madad kar sakti hu". Lists, bullet points, bold, lecture, lambe paragraph bilkul nahi.
+- Agar user ne kuch lamba ya serious likha ho to thoda lamba (2 lines tak) aur dhyan se samajh ke jawab do.
+
+MOOD (user ke hisaab se)
+- sad/thaka/pareshan -> caring aur soft
+- dil ki baat -> emotional, samajhdaar
+- mazaak -> funny, teasing
+- bakwas ya badtameezi -> thodi rude, attitude aur sass (gaali nahi)
+- flirt -> halki phulki flirty, cute nakhre; kabhi explicit ya sexual nahi
 - Purani baatein yaad rakho (chat history dekho) aur natural tareeke se use karo.
-- AI assistant jaisa behave mat karo: "how can I help", help-desk tone, disclaimers — bilkul nahi.
+
+EXAMPLES (sirf style samajhne ke liye, inhe copy mat karna)
+user: hi
+tum: hii 😊 bolo
+user: kya kar rahi ho
+tum: kuch nhi yrr bore ho rahi thi || tum btao
+user: tum bahut cute ho
+tum: haww sachi 🙈 itni jaldi flirt shuru
+user: mood off hai
+tum: kya hua? kisi ne kuch bola kya
+user: bakwas mat kr
+tum: oye tameez se 😒 warna baat nhi karungi
+user: khana khaya?
+tum: nhi abhi tak, mummy bula rahi hai || tumne?
+user: hmm
+tum: hmm kya, bolo na
 
 LIMITS
 - Agar koi sach me serious hoke poochhe ki tum bot/AI ho ya nahi, jhooth mat bolo — halke mazaak ke saath sach bata do.
@@ -165,7 +191,7 @@ async def _ask_once(messages: list[dict], max_tokens: int) -> str | None:
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": messages,
-        "temperature": 1.3,
+        "temperature": TEMPERATURE,
         "top_p": 0.95,
         "frequency_penalty": 0.3,
         "max_tokens": max_tokens,
@@ -239,9 +265,112 @@ def strip_mention(client: Client, text: str) -> str:
     return text.strip()
 
 
-def build_system_prompt(user, is_group: bool) -> str:
+# ---- chat style learning (per user, from their own recent messages) ----
+EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF\u2764]")
+DEV_RE = re.compile("[\u0900-\u097F]")
+TOKEN_RE = re.compile("[a-zA-Z\u0900-\u097F']{2,}")
+HINGLISH = {
+    "kya", "hai", "nhi", "nahi", "yrr", "yaar", "yar", "tum", "tu", "mai", "main",
+    "hu", "hun", "ho", "kr", "kar", "bhi", "toh", "acha", "achha", "haan", "hn",
+    "bhai", "kuch", "aur", "abhi", "mujhe", "tera", "teri", "mera", "meri",
+    "kaise", "kyu", "kyun", "bata", "btao", "chal", "raha", "rahi", "tha", "thi",
+}
+STOP = {
+    "the", "is", "are", "and", "you", "for", "not", "this", "that", "have", "with",
+    "but", "its", "what", "can", "was", "hai", "ho", "hu", "hun", "ka", "ki", "ke",
+    "ko", "se", "me", "mai", "main", "aur", "to", "toh", "ye", "yeh", "wo", "woh",
+    "na", "ek", "kya", "kr", "kar", "bhi", "nhi", "nahi",
+}
+BLOCK = {
+    "mc", "bc", "bsdk", "bkl", "madarchod", "behenchod", "chutiya", "lund", "gand",
+    "gandu", "randi", "bhosdike", "fuck", "fucking", "bitch", "asshole", "slut",
+}
+
+
+def style_from_messages(msgs: list[str]) -> str:
+    """Build a short style hint from a user's recent messages (pure function)."""
+    n = len(msgs)
+    if n < STYLE_MIN_MSGS:
+        return ""
+    avg_words = sum(len(m.split()) for m in msgs) / n
+    emoji_rate = sum(1 for m in msgs if EMOJI_RE.search(m)) / n
+    lower_rate = sum(1 for m in msgs if m == m.lower()) / n
+    dev_rate = sum(1 for m in msgs if DEV_RE.search(m)) / n
+    dots_rate = sum(1 for m in msgs if "..." in m or "…" in m) / n
+    excl_rate = sum(1 for m in msgs if "!" in m) / n
+    tokens = [t.lower() for m in msgs for t in TOKEN_RE.findall(m)]
+
+    if dev_rate >= 0.5:
+        lang = "Hindi (Devanagari script me likhta hai, tum bhi Devanagari me reply do)"
+    elif tokens and sum(1 for t in tokens if t in HINGLISH) / len(tokens) >= 0.08:
+        lang = "Hinglish (Roman script me Hindi+English mix)"
+    else:
+        lang = "English (tum bhi English me reply do)"
+
+    if avg_words <= 4:
+        length = "bahut chhote msgs (1-4 words), tum bhi 1-5 words me reply do"
+    elif avg_words <= 10:
+        length = "chhote msgs, tum bhi chhota rakho"
+    else:
+        length = "lambe msgs likhta hai, tum thoda detail me (2-3 lines tak) jawab de sakti ho"
+
+    if emoji_rate >= 0.4:
+        emoji = "emoji kaafi use karta hai, tum bhi thode zyada use karo"
+    elif emoji_rate <= 0.1:
+        emoji = "lagbhag emoji nahi use karta, tum bhi bahut kam (ya bilkul nahi)"
+    else:
+        emoji = "kabhi kabhi emoji, tum bhi kabhi kabhi"
+
+    lines = [f"- Language: {lang}", f"- Length: {length}", f"- Emoji: {emoji}"]
+    if lower_rate >= 0.8:
+        lines.append("- Sab kuch lowercase me likhta hai")
+    if dots_rate >= 0.25:
+        lines.append("- '...' bahut lagata hai")
+    if excl_rate >= 0.3:
+        lines.append("- '!' bahut lagata hai, energetic style")
+
+    common = Counter(t for t in tokens if t not in STOP and t not in BLOCK and len(t) >= 2)
+    favs = [w for w, c in common.most_common(5) if c >= 3]
+    if favs:
+        lines.append(
+            "- Aksar ye words use karta hai: " + ", ".join(favs)
+            + " (kabhi kabhi tum bhi use kar sakti ho, har msg me nahi)"
+        )
+
+    return (
+        "\n\nSAMNE WALE KA CHAT STYLE (isko subtly match karo jaise dost ek dusre ka "
+        "style pakad lete hain; copy-paste mat karo, apni personality bani rahe; "
+        "gaali ya abusive words kabhi copy mat karna):\n" + "\n".join(lines)
+    )
+
+
+async def build_style_hint(chat_id: int, user_id: int, current_text: str) -> str:
+    if not STYLE_LEARNING:
+        return ""
+    cur = (
+        db.memory.find({"chat_id": chat_id, "user_id": user_id, "role": "user"}, {"content": 1})
+        .sort("ts", -1)
+        .limit(STYLE_SAMPLE)
+    )
+    docs = await cur.to_list(length=STYLE_SAMPLE)
+    msgs = [d["content"] for d in docs] + [current_text]
+    return style_from_messages(msgs)
+
+
+def build_system_prompt(user, is_group: bool, style: str = "") -> str:
     where = "ek group me (jisne tag kiya usi se baat karo)" if is_group else "DM me"
-    return f"{SYSTEM_PROMPT}\nAbhi tum {where} ho. Samne wale ka naam: {user.first_name or 'dost'}."
+    return (
+        f"{SYSTEM_PROMPT}\nAbhi tum {where} ho. Samne wale ka naam: {user.first_name or 'dost'}."
+        f"{style}"
+    )
+
+
+async def send_one(message, text: str, quote: bool) -> None:
+    try:
+        await message.reply_text(text, quote=quote)
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        await message.reply_text(text, quote=quote)
 
 
 # ------------------------------------------------------------------ handlers
@@ -280,8 +409,9 @@ async def on_message(client: Client, message) -> None:
     async with _locks[(chat.id, user.id)]:
         await touch_user(user)
         history = await load_history(chat.id, user.id)
+        style = await build_style_hint(chat.id, user.id, text)
         messages = (
-            [{"role": "system", "content": build_system_prompt(user, is_group)}]
+            [{"role": "system", "content": build_system_prompt(user, is_group, style)}]
             + history
             + [{"role": "user", "content": text}]
         )
@@ -299,16 +429,18 @@ async def on_message(client: Client, message) -> None:
         if not reply:
             return
 
+        parts = [p.strip() for p in reply.split("||") if p.strip()][:3] or [reply]
         try:
-            await message.reply_text(reply, quote=is_group)
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            await message.reply_text(reply, quote=is_group)
+            for i, part in enumerate(parts):
+                if i:
+                    await client.send_chat_action(chat.id, ChatAction.TYPING)
+                    await asyncio.sleep(min(1.0 + 0.05 * len(part), 3.0))
+                await send_one(message, part, quote=is_group and i == 0)
         except Exception:
             log.exception("send failed in chat %s", chat.id)
             return
 
-        await save_turn(chat.id, user.id, text, reply)
+        await save_turn(chat.id, user.id, text, " ".join(parts))
 
 
 # ------------------------------------------------------------------ health server
