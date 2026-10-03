@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: girl-chatbot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: STRING_SESSION
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: DEEPSEEK_MODEL
+        value: deepseek-chat
+      - key: PERSONA_NAME
+        value: Riya
+      - key: REPLY_DELAY
+        value: "3"
+      - key: HISTORY_LIMIT
+        value: "20"
+      - key: MEMORY_DAYS
+        value: "90"
